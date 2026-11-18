@@ -1,0 +1,46 @@
+policy_name: pi05_flashvla
+
+# ── Server-side fields (policy_model_server.py) ──
+# Absolute path to a flashvla PI05 FlashVLA checkpoint directory.
+# Must contain: config.json, model.safetensors, policy_preprocessor.json,
+# policy_postprocessor.json, and the corresponding *_processor.safetensors.
+policy_path: null
+
+# Cold-start action source for the first (num_buffer_slots - 1) chunks:
+#   - "current_state": hold current qpos (required for RoboTwin)
+#   - "zero_delta":    return zero delta (breaks absolute-qpos envs)
+cold_start_mode: current_state
+
+device: cuda
+
+# Async overlap: launch the next chunk inference this many steps before
+# the current chunk ends. 0 = sync (transition triggers blocking inference).
+# Requires the ckpt to have compile_model=true for real GPU hiding;
+# otherwise the launch is just synchronous Python dispatch and you get no
+# benefit. Should be <= n_action_steps; we use 1–2 with the chunk-20
+# RoboTwin checkpoint.
+inference_overlap_steps: 0
+
+# RTC realignment: when promoting a chunk launched inference_overlap_steps
+# early, skip its first inference_overlap_steps actions (they target control
+# steps the outgoing chunk already executed) and consume
+# [overlap, overlap + n_action_steps) of the full predicted chunk. Requires
+# inference_overlap_steps + n_action_steps <= chunk_size.
+skip_stale_actions: false
+
+# Match the 16-action execution horizon used for both pi0.5 and FlashVLA in
+# the reported RoboTwin 2.0 50-task evaluation.
+n_action_steps: 16
+
+# Optional: override compile_model. Recommended for async runs because
+# torch.compile + CUDA graphs are what make predict_action_chunk non-blocking.
+compile_model: null
+
+# ── Client-side fields (eval_policy_client.py) ──
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+# Use the training-set instruction templates/descriptions.
+instruction_type: seen
+policy_conda_env: flashvla

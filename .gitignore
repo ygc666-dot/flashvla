@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Model checkpoints / weights
+ckpt/
+checkpoints/
+outputs/
+weights/
+wandb/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.pkl
+
+# Evaluation results
+results/
+results_*/
+eval_results/
+
+# Logs
+logs/
+*.log
+*.log.*
+nohup.out
+
+# Editors / misc
+*.swp
+*.swo
+.DS_Store
