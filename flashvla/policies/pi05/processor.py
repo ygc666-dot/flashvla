@@ -103,6 +103,21 @@ class FlashVLAPi05PrepareLanguageProcessorStep(ProcessorStep):
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
 
+    def get_config(self) -> dict[str, Any]:
+        """Persist the constructor arguments.
+
+        `ProcessorStep.get_config` defaults to `{}`, so without this override the
+        saved `policy_preprocessor.json` reloads this step with `state_cond=False`
+        and silently switches the prompt from "Task: X;" to "Task: X, State: ...;"
+        -- a prompt the policy never saw in training (46 vs 12 tokens, and a
+        training-loss gap of 0.31 vs 0.16 in the bridge run).
+        """
+        return {
+            "state_cond": self.state_cond,
+            "max_state_dim": self.max_state_dim,
+            "task_key": self.task_key,
+        }
+
 
 def make_flashvla_pi05_pre_post_processors(
     config: PI05Config,

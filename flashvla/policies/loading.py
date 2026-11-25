@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Collection, Iterable
 
@@ -235,24 +236,69 @@ def remap_pi05_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
     return remapped
 
 
-def load_pi05_checkpoint(model: nn.Module, model_file: str) -> None:
-    """Fill a PI0.5 policy from ``model.safetensors``: rename, then one strict load.
+# Continuous-proprio (`state_cond=True`) additions. They only exist in policies
+# built with `state_cond=True`, so a released PI0.5 checkpoint (discrete-state
+# pre-training) never contains them. Both suffix embedders zero-init
+# `state_mlp_out`, so leaving these tensors at their constructor values means
+# "no state contribution at step 0" -- the same convention pi0-flashvla uses for
+# freshly initialized FiLM layers (`allow=freshly_initialized`).
+PI05_STATE_COND_PARAM_PREFIXES: tuple[str, ...] = (
+    "model.suffix_embedder.state_proj.",
+    "model.suffix_embedder.state_mlp_in.",
+    "model.suffix_embedder.state_mlp_out.",
+)
+
+
+def load_pi05_checkpoint(
+    model: nn.Module,
+    model_file: str,
+    *,
+    allow: Collection[str] = PI05_STATE_COND_PARAM_PREFIXES,
+) -> None:
+    """Fill a PI0.5 policy from ``model.safetensors``: rename, then load.
 
     The file is read on the CPU (every rank of a distributed job shares one
     default GPU at this point); the caller moves the policy afterwards.
+
+    Every tensor must come from the checkpoint except the names covered by
+    ``allow`` (by default the `state_cond` projections a discrete-state
+    checkpoint cannot contain); anything else missing or unexpected is fatal, so
+    a layout drift is still caught before training.
     """
     from safetensors.torch import load_file
 
     state_dict = remap_pi05_state_dict(load_file(model_file))
-    try:
-        model.load_state_dict(state_dict, strict=True)
-    except RuntimeError as error:
-        if any(key.startswith(_PRE_ALIAS_FREE_MARKERS) for key in state_dict):
-            raise RuntimeError(
-                f"{model_file} was saved before the alias-free PI0.5 layout; convert it once with "
-                "`python -m flashvla.policies.pi05.convert_legacy_checkpoint <src_dir> <dst_dir>`"
-            ) from error
-        raise
+    incompatible = model.load_state_dict(state_dict, strict=False)
+
+    allowed_prefixes = tuple(allow)
+    tolerated = [
+        key
+        for key in incompatible.missing_keys
+        if allowed_prefixes and key.startswith(allowed_prefixes)
+    ]
+    tolerated_set = set(tolerated)
+    missing = [key for key in incompatible.missing_keys if key not in tolerated_set]
+    unexpected = list(incompatible.unexpected_keys)
+
+    if missing and any(key.startswith(_PRE_ALIAS_FREE_MARKERS) for key in state_dict):
+        raise RuntimeError(
+            f"{model_file} was saved before the alias-free PI0.5 layout; convert it once with "
+            "`python -m flashvla.policies.pi05.convert_legacy_checkpoint <src_dir> <dst_dir>`"
+        )
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint {model_file!r} does not cover the model.\n"
+            f"  missing: {missing[:10]}{' ...' if len(missing) > 10 else ''}\n"
+            f"  unexpected: {unexpected[:10]}{' ...' if len(unexpected) > 10 else ''}"
+        )
+    if tolerated:
+        logging.warning(
+            "PI0.5 load: %d state_cond tensor(s) absent from %s, kept at their "
+            "constructor values (zero state contribution at step 0): %s",
+            len(tolerated),
+            model_file,
+            tolerated[:6],
+        )
 
 
 # Names only a checkpoint from before the alias-free layout can contain.

@@ -85,6 +85,32 @@ class FlashVLATrainConfig(TrainPipelineConfig):
     checkpoint_keep_last: int = 0
     checkpoint_keep_every_n_steps: int = 0
 
+    # Multiplier on the lr of the `state_cond` FiLM path
+    # (`suffix_embedder.state_{proj,mlp_in,mlp_out}`). Those six tensors are
+    # zero-initialized and, sharing the trunk lr, were still contributing only
+    # ~7e-5 to the action after 4000 steps on bridge -- the state input was
+    # effectively unused (`docs/.../3_5_p3_execution_report.md` §11.3).
+    # 1.0 keeps the original single-group behaviour.
+    state_path_lr_mult: float = 1.0
+
+    # Std of a *normal* re-init of `suffix_embedder.state_mlp_out` right before the
+    # optimizer is built. The model ships with this layer zero-initialized, which
+    # makes the FiLM branch additive-zero: after 4000 steps its contribution is
+    # ~1e-5 against a ~1e-2 time embedding, and 250 steps at 10x lr only grew the
+    # weight by 1.7% (measured). A non-zero init starts the branch at a usable
+    # scale instead of asking it to climb ~1000x from zero. 0.0 = keep zero-init.
+    state_path_init_std: float = 0.0
+
+    # Std of a *normal* re-init of `suffix_embedder.proprio_in_proj` right before
+    # the optimizer is built (F6/S5 arm ②). A converted checkpoint carries π0*'s
+    # pretrained encoder in that tensor; re-initialising it turns the arm into
+    # "the proprio block, but without the prior", which is the only way to
+    # separate "the structure is worth something" from "π0*'s encoder is worth
+    # something". Kept >=0.1 on purpose: `f6_s0_s1.md` §7.4 measured that a
+    # 1e-3-scale init is structurally frozen under Adafactor (its relative step
+    # is normalised by the parameter's own RMS). 0.0 = keep the checkpoint value.
+    proprio_in_proj_init_std: float = 0.0
+
     def validate(self) -> None:
         if self.flashvla_init.mode not in {"default", "ae-norm-zero"}:
             raise ValueError(

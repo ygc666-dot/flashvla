@@ -103,6 +103,13 @@ class PI0SuffixEmbedder(nn.Module):
         self.action_time_mlp_in = nn.Linear(width * 2, width)
         self.action_time_mlp_out = nn.Linear(width, width)
 
+        # F6: π0*'s proprio *input encoder* — a single linear on the raw 8-D
+        # proprio, standing in for `state_proj` when the proprio stack is on.
+        # Its output width must match the action expert because the state token
+        # joins the same 1024-wide residual stream.
+        if config.use_proprio_stack:
+            self.proprio_in_proj = nn.Linear(config.proprio_input_dim, width)
+
         if config.use_adarms_time_cond:
             self.time_mlp_in = nn.Linear(width, width)
             self.time_mlp_out = nn.Linear(width, width)
@@ -112,6 +119,19 @@ class PI0SuffixEmbedder(nn.Module):
             nn.init.zeros_(self.state_mlp_out.bias)
 
         self.C = config.chunk_size
+
+    def project_state(self, state: Tensor) -> Tensor:
+        """Embed the robot state into the suffix's leading token.
+
+        With the π0* proprio stack the token is produced by π0*'s own input
+        encoder instead of the freshly-initialised `state_proj`. `state` arrives
+        right-padded to `max_state_dim` (`utils.pad_vector`), while the encoder is
+        `proprio_input_dim` wide, so the padding has to be sliced off.
+        """
+        if getattr(self.config, "use_proprio_stack", False):
+            real = self.config.proprio_input_dim
+            return self.proprio_in_proj(state[..., :real])
+        return self.state_proj(state)
 
     def forward(
         self,
@@ -202,7 +222,7 @@ class PI0SuffixEmbedder(nn.Module):
         if padding_mask is not None:
             action_time_emb = action_time_emb * padding_mask.unsqueeze(-1).to(action_time_emb.dtype)
 
-        state_emb = self.state_proj(state)[:, None, :]
+        state_emb = self.project_state(state)[:, None, :]
         embs = torch.cat([state_emb, action_time_emb], dim=1)
 
         if padding_mask is not None:
@@ -230,8 +250,9 @@ class FlashVLAPI0ModelLayer(BasePI0ModelLayer):
         config: PI0FlashVLAConfig,
         vlm_layer: nn.Module,
         action_expert_layer: nn.Module,
+        share_proprio: bool = False,
     ):
-        super().__init__(config, vlm_layer, action_expert_layer)
+        super().__init__(config, vlm_layer, action_expert_layer, share_proprio=share_proprio)
         self.input_layernorm = nn.ModuleList(self.input_layernorm)
         self.post_attention_layernorm = nn.ModuleList(self.post_attention_layernorm)
 
@@ -251,8 +272,24 @@ class PI0FlashVLAModel(nn.Module):
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
 
+        # F6: π0* feeds an 8-D proprio token through its own *mixture block* that
+        # shares the action mixture's weights (`pizero.py:274-276`), so the third
+        # stream costs one 1024x8 input encoder and no extra decoder parameters.
+        self.use_proprio_stack = bool(config.use_proprio_stack)
+        if self.use_proprio_stack and config.use_adarms_time_cond:
+            raise ValueError(
+                "use_proprio_stack requires use_adarms_time_cond=False: the "
+                "adaRMS path drops the state token entirely, so there is no "
+                "suffix position for a proprio block to live in"
+            )
+
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI0SuffixEmbedder(config)
+        if self.use_proprio_stack:
+            # The proprio block owns the state token, so `state_proj` is dead
+            # weight on this path. Freeze it so multi-GPU runs do not trip DDP's
+            # unused-parameter reduction check.
+            self.suffix_embedder.state_proj.requires_grad_(False)
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
@@ -260,6 +297,7 @@ class PI0FlashVLAModel(nn.Module):
                 config,
                 self.vlm.model.language_model.layers[i],
                 self.action_expert.model.layers[i],
+                share_proprio=self.use_proprio_stack,
             )
             for i in range(num_hidden_layers)
         ])
@@ -284,7 +322,6 @@ class PI0FlashVLAModel(nn.Module):
         self.action_expert.model.layers = nn.ModuleList(
             [nn.Identity() for _ in range(num_layers)]
         )
-
     def set_fsdp_compute_dtype(self, dtype: torch.dtype) -> None:
         """Record the unsharded compute dtype without consulting master shards."""
         if dtype not in {torch.float32, torch.bfloat16}:
@@ -423,6 +460,44 @@ class PI0FlashVLAModel(nn.Module):
         return time_per_slot, time_per_token
 
 
+    def _split_suffix_streams(self, suffix_embs: Tensor) -> tuple[Tensor, Tensor]:
+        """Split the interleaved suffix into ``(action_tokens, state_tokens)``.
+
+        The suffix is written per block as ``[state, act_0 .. act_L-1]`` with
+        ``L = self.N * self.C`` (`forward_shared_observation` tiles it ``N`` times
+        for the ``N`` cold-start configs; `denoise_step` has a single block).
+        ``PI0Attention`` re-interleaves this back onto the mask's order, so the
+        only contract here is one state token per ``1 + self.N * self.C`` tokens.
+        """
+        N, C = self.N, self.C
+        block_len = 1 + N * C
+        bsz, tokens, width = suffix_embs.shape
+        if tokens % block_len:
+            raise ValueError(
+                f"suffix length {tokens} is not a multiple of {block_len} "
+                f"(1 state token + N*C action tokens, N={N}, C={C})"
+            )
+        num_blocks = tokens // block_len
+        blocks = suffix_embs.view(bsz, num_blocks, block_len, width)
+        action = blocks[:, :, 1:, :].reshape(bsz, tokens - num_blocks, width)
+        state = blocks[:, :, 0, :]
+        return action, state
+
+    def _suffix_hidden_states(
+        self, suffix_embs: Tensor, suffix_adarms_cond: Tensor | None
+    ) -> tuple[list, list]:
+        """Suffix streams (past the prefix slot) and their per-stream conds."""
+        if not self.use_proprio_stack:
+            return [suffix_embs], [suffix_adarms_cond]
+        action_embs, state_embs = self._split_suffix_streams(suffix_embs)
+        return [action_embs, state_embs], [suffix_adarms_cond, None]
+
+    def _empty_prefix_streams(self) -> tuple[list, list]:
+        """Placeholders for the prefix slot: ``[prefix]`` + ``[None]`` per backbone."""
+        if not self.use_proprio_stack:
+            return [None], [None]
+        return [None, None], [None, None]
+
     def forward_shared_observation(
         self, images, img_masks, tokens, masks,
         states, actions, action_is_pad,
@@ -443,6 +518,14 @@ class PI0FlashVLAModel(nn.Module):
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
+
+        if getattr(self.config, "mask_padded_action_dims", False):
+            real_dim = self.config.real_action_dim
+            if real_dim < noise.shape[-1]:
+                noise = noise.clone()
+                noise[..., real_dim:] = 0.0
+                actions = actions.clone()
+                actions[..., real_dim:] = 0.0
 
         time_per_slot_all, time_per_token = self._build_per_chunk_time(
             batch_size, device,
@@ -495,19 +578,25 @@ class PI0FlashVLAModel(nn.Module):
             dtype=prefix_embs.dtype,
         )
 
-        hidden_states = [prefix_embs, suffix_embs]
-        conds = [None, suffix_adarms_cond]
+        suffix_streams, suffix_conds = self._suffix_hidden_states(
+            suffix_embs, suffix_adarms_cond
+        )
+        hidden_states = [prefix_embs, *suffix_streams]
+        conds = [None, *suffix_conds]
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
 
         _, _ = self.vlm.language_model.norm(hidden_states[0], cond=None)
         suffix_out, _ = self.action_expert.model.norm(hidden_states[1], cond=suffix_adarms_cond)
 
-        suffix_out = suffix_out.view(batch_size, N, L_suf, -1)
-        if use_adarms:
+        if self.use_proprio_stack:
+            # Only the action tokens reach `action_out_proj`; the proprio block's
+            # output is discarded, exactly as in π0* (nothing decodes it).
             action_out = suffix_out
+        elif use_adarms:
+            action_out = suffix_out.view(batch_size, N, L_suf, -1)
         else:
-            action_out = suffix_out[:, :, 1:, :]
+            action_out = suffix_out.view(batch_size, N, L_suf, -1)[:, :, 1:, :]
         action_out = action_out.reshape(batch_size, N * H_cfg, -1)
         action_out = action_out.to(dtype=self.action_out_proj.weight.dtype)
         v_t = self.action_out_proj(action_out)
@@ -557,15 +646,20 @@ class PI0FlashVLAModel(nn.Module):
         attention_mask = full_attention_mask[:, :, -L_suf:, :]
         position_ids = full_position_ids[:, -L_suf:]
 
-        hidden_states = [None, suffix_embs]
-        conds = [None, suffix_adarms_cond]
+        suffix_streams, suffix_conds = self._suffix_hidden_states(
+            suffix_embs, suffix_adarms_cond
+        )
+        hidden_states = [None, *suffix_streams]
+        conds = [None, *suffix_conds]
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=True)
 
         suffix_hidden = hidden_states[1]
         suffix_hidden, _ = self.action_expert.model.norm(suffix_hidden, cond=suffix_adarms_cond)
 
-        if self.config.use_adarms_time_cond:
+        if self.use_proprio_stack or self.config.use_adarms_time_cond:
+            # The proprio block carries the state token on this path, so the
+            # action stream no longer needs its leading token sliced off.
             action_hidden = suffix_hidden
         else:
             action_hidden = suffix_hidden[:, 1:, :]
@@ -603,8 +697,9 @@ class PI0FlashVLAModel(nn.Module):
         prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
             prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
         )
-        hidden_states_prefill = [prefix_embs, None]
-        conds_prefill = [None, None]
+        prefix_tail, prefix_conds = self._empty_prefix_streams()
+        hidden_states_prefill = [prefix_embs, *prefix_tail]
+        conds_prefill = [None, *prefix_conds]
         for layer in self.layers:
             hidden_states_prefill = layer(
                 hidden_states_prefill, prefix_attention_mask, prefix_position_ids,
@@ -680,8 +775,9 @@ class PI0FlashVLAModel(nn.Module):
         prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
             prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
         )
-        hidden_states_prefill = [prefix_embs, None]
-        conds_prefill = [None, None]
+        prefix_tail, prefix_conds = self._empty_prefix_streams()
+        hidden_states_prefill = [prefix_embs, *prefix_tail]
+        conds_prefill = [None, *prefix_conds]
         for layer in self.layers:
             hidden_states_prefill = layer(
                 hidden_states_prefill, prefix_attention_mask, prefix_position_ids,
@@ -1059,7 +1155,10 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
             images, img_masks, lang_tokens, lang_masks,
             states, actions, action_is_pad, noise,
         )
-        losses = losses[..., :self.config.max_action_dim]
+        loss_dim = self.config.max_action_dim
+        if getattr(self.config, "mask_padded_action_dims", False):
+            loss_dim = self.config.real_action_dim
+        losses = losses[..., :loss_dim]
         loss = losses.mean()
         loss_dict["loss"] = loss.item()
         return loss, loss_dict

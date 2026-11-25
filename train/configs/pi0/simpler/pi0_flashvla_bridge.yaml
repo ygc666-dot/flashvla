@@ -1,0 +1,98 @@
+# π0*（open-pi-zero bridge_beta）→ FlashVLA `pi0-flashvla`，SIMPLER / BridgeData widowx。
+#
+# 方案、映射表与门禁见 `docs/sdn_flashvla/pi0_flashvla/4_pi0star_flashvla.md`；
+# 归因与修法（本文件的 F1/F2/F3/F4）见 `docs/sdn_flashvla/pi0_flashvla/pi_star_analysis.md` §5。
+#
+# 与 pi05 配方 / 上一轮（12.5%）配方的差别：
+#   1. `type: pi0-flashvla` —— 不经过 pi05，直接用 FlashVLA 已有的 pi0 policy；
+#   2. `empty_cameras: 0` —— π0* 是单视角（224×224），pi05 配方用 2 是为了凑 pi05_base 的三槽；
+#   3. 无 `state_cond` / `freeze_vision_encoder` —— pi0 配置类没有这两个字段，写进去会解析失败；
+#   4. **F1** `STATE/ACTION: QUANTILES` —— π0* 的头部是按 `2(x−q01)/(q99−q01)−1`（openpi `bound`）
+#      标定的，换回 MEAN_STD 等于要求动作头凭空把输出放大 ~1.95×（初始真实维 loss 4.32 vs 1.46）；
+#   5. **F2** `mask_padded_action_dims: true` —— 32 维里只有 7 维是真的，剩下 25 维在转换后的
+#      checkpoint 里 `action_in_proj[:, 7:]` / `action_out_proj[7:, :]` 全是零，loss 恒等于
+#      `25/32 · E[noise²] = 0.781`，还会吃掉 78% 的梯度。掩掉后 loss 读数直接等于真实 7 维 loss；
+#   6. **F3** `state_path_lr_mult: 3.0` + 转换时 `state_proj` 用 N(0, 1e-3) 初始化（见下面的转换命令），
+#      否则 state 通路与上一轮一样停在 rms 1.7e-5（等于 state-blind）。
+#
+# 起点是 `scripts/p4/convert_pi0star.py --write` 产出的目录（779 个张量 / 8.0 GB）：
+#   PY=/home/zjr/workspace_tj/StreamingVLA/miniconda_ygc/envs/flashvla/bin/python
+#   $PY scripts/p4/convert_pi0star.py \
+#     --src third_party/SDN/pretrained/open-pi-zero/bridge_beta_step19296_2024-12-26_22-30_42.pt \
+#     --data /data/zjr/simpler_lerobot/bridge/widowx_stack_cube/success \
+#     --empty-cameras 0 --write --dst ckpt/pi0star_bridge_flashvla \
+#     --state-proj-init-std 1e-3 --json logs/p4/convert_bridge.json
+
+policy:
+  type: pi0-flashvla
+  pretrained_path: /home/zjr/workspace_tj/StreamingVLA/flashvla/ckpt/pi0star_bridge_flashvla
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  num_buffer_slots: 4
+  chunk_size: 4
+  n_action_steps: 4
+  empty_cameras: 0
+  cold_start_mode: zero_delta
+  use_adarms_time_cond: false
+  mask_padded_action_dims: true      # F2：25 个填充维不吃梯度，loss 读数 = 真实 7 维 loss
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES                # F1：π0* 的 proprio 也是 bound
+    ACTION: QUANTILES               # F1：关键，让动作头从第 0 步就落在原生输出尺度
+
+dataset:
+  repo_id: simpler/bridge
+  video_backend: torchcodec
+
+robotwin_multitask:
+  enable: true
+  root: /data/zjr/simpler_lerobot/bridge
+  config_subdirs:
+  - success
+
+output_dir: /data/zjr/simpler_lerobot/runs/pi0_flashvla_bridge_q8000   # F4：新开 run，不续跑旧目录
+job_name: pi0-flashvla-bridge-q8000
+batch_size: 4                 # 17_784 帧；bs4×accum8 = 等效 32 → 556 step/epoch → 8000 步 ≈ 14.4 epoch
+grad_accum_steps: 8
+steps: 8000
+num_workers: 4
+seed: 1000
+
+fsdp:
+  enable: false               # P3 实测结论：单卡 adafactor + 状态留卡上比 1 进程 FSDP 快
+  mixed_precision: bf16
+  reduce_dtype: float32
+  reshard_after_forward: false
+  cpu_offload: false
+  state_dict_type: SHARDED_STATE_DICT
+  save_pretrained_max_shard_size: 50GB
+
+use_policy_training_preset: false
+optimizer:
+  type: adafactor
+  lr: 5.0e-05
+  weight_decay: 1.0e-10
+  grad_clip_norm: 1.0
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 300
+  peak_lr: 5.0e-05
+  decay_lr: 2.5e-07
+  num_decay_steps: 8000
+
+state_path_lr_mult: 3.0       # F3：state_proj 是该路径仅有的两个张量，lr ×3
+
+flashvla_init:
+  mode: default               # π0* 的时间 MLP 与归一化层都要保留，不能重初始化
+
+save_checkpoint: true
+save_freq: 500
+checkpoint_keep_last: 6
+checkpoint_keep_every_n_steps: 0
+log_freq: 50
+wandb:
+  enable: false
+  project: p4-pi0star-bridge
+  entity: null
+  disable_artifact: true

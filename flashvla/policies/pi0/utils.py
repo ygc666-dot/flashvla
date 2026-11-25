@@ -123,6 +123,110 @@ def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
     return new_vector
 
 
+# --------------------------------------------------------------------------- #
+# F6/S4: bridge's 7-D `POS_EULER` proprio
+# --------------------------------------------------------------------------- #
+# π0*'s bridge adapter (`simpler_adapter.py:179-192`, BridgeSimplerAdapter) turns
+# the 8-D raw `eef_pos` `[x, y, z, qw, qx, qy, qz, grip]` into a 7-D proprio
+#
+#   [x, y, z, roll, pitch, yaw, grip]
+#
+#   R   = quat2mat([qw, qx, qy, qz])           (transforms3d layout, w first)
+#   R'  = R @ BRIDGE_DEFAULT_ROT.T             (bridge's EEF frame is top-down)
+#   rpy = mat2euler(R', axes="sxyz")           (radians, x-y-z fixed order)
+#
+# Reproduced here in torch so the whole thing is batched and differentiable-free;
+# `scripts/p4/f6_s4_bridge_proprio.py` checks it element-wise against the π0*
+# reference in float64.
+
+# `simpler_adapter.py:172-174` (from bridge_data_robot's widowx_controller).
+BRIDGE_DEFAULT_ROT: tuple[tuple[float, float, float], ...] = (
+    (0.0, 0.0, 1.0),
+    (0.0, 1.0, 0.0),
+    (-1.0, 0.0, 0.0),
+)
+
+# transforms3d thresholds (`geometry.py:10`, `:46`).
+_QUAT_EPS = 2.220446049250313e-16
+_EULER_EPS = 4.0 * _QUAT_EPS
+
+
+def quat_wxyz_to_mat(quat: Tensor) -> Tensor:
+    """Rotation matrices for ``[..., 4]`` w-first quaternions (transforms3d `quat2mat`).
+
+    Matches the reference, including its behaviour for (near-)zero quaternions:
+    it returns the identity instead of a garbage matrix.
+    """
+    w, x, y, z = quat.unbind(-1)
+    nq = w * w + x * x + y * y + z * z
+    degenerate = nq < _QUAT_EPS
+    # `s = 2 / nq` would blow up on the degenerate rows, so pinch them to 1 there
+    # and let the `where` at the end substitute the identity.
+    s = 2.0 / torch.where(degenerate, torch.ones_like(nq), nq)
+    xx, yy, zz = x * s * x, y * s * y, z * s * z
+    xy, xz, yz = x * s * y, x * s * z, y * s * z
+    wx, wy, wz = w * s * x, w * s * y, w * s * z
+    one = torch.ones_like(xx)
+    mat = torch.stack(
+        [
+            torch.stack([one - (yy + zz), xy - wz, xz + wy], dim=-1),
+            torch.stack([xy + wz, one - (xx + zz), yz - wx], dim=-1),
+            torch.stack([xz - wy, yz + wx, one - (xx + yy)], dim=-1),
+        ],
+        dim=-2,
+    )
+    eye = torch.eye(3, dtype=mat.dtype, device=mat.device).expand_as(mat)
+    return torch.where(degenerate[..., None, None], eye, mat)
+
+
+def mat_to_euler_sxyz(mat: Tensor) -> Tensor:
+    """``mat2euler(mat, axes="sxyz")`` for ``[..., 3, 3]`` rotation matrices.
+
+    ``sxyz`` fixes ``i, j, k = 0, 1, 2`` with parity 0 / frame 0 in transforms3d,
+    which reduces to ``roll = atan2(M21, M22)``, ``pitch = atan2(-M20, cy)``,
+    ``yaw = atan2(M10, M00)`` with ``cy = hypot(M00, M10)``. The ``cy <= eps``
+    branch is gimbal lock (pitch = +-90 deg) where only roll+yaw is defined; the
+    reference picks ``roll = atan2(-M12, M11)`` and ``yaw = 0``.
+    """
+    cy = torch.sqrt(mat[..., 0, 0] ** 2 + mat[..., 1, 0] ** 2)
+    regular = cy > _EULER_EPS
+    roll = torch.where(
+        regular,
+        torch.atan2(mat[..., 2, 1], mat[..., 2, 2]),
+        torch.atan2(-mat[..., 1, 2], mat[..., 1, 1]),
+    )
+    pitch = torch.atan2(-mat[..., 2, 0], cy)
+    yaw = torch.where(
+        regular,
+        torch.atan2(mat[..., 1, 0], mat[..., 0, 0]),
+        torch.zeros_like(cy),
+    )
+    return torch.stack([roll, pitch, yaw], dim=-1)
+
+
+def bridge_proprio_from_state(state: Tensor) -> Tensor:
+    """Map an 8-D FlashVLA state to π0*'s 7-D bridge proprio.
+
+    ``state`` is ``[..., 8]`` = ``[x, y, z, qw, qx, qy, qz, grip]`` (q_wxyz, the
+    layout `sim_eval/simpler/convert_simpler_to_lerobot.py` writes), the return is
+    ``[..., 7]`` = ``[x, y, z, roll, pitch, yaw, grip]`` in radians with the grip
+    dimension passed through untouched (both sides use *openness*, 0 = closed).
+
+    Atan2 on float32 is accurate to ~1e-7, well inside the 1e-6 alignment budget;
+    pass a float64 state to reproduce the reference exactly.
+    """
+    if state.shape[-1] != 8:
+        raise ValueError(f"bridge proprio needs the 8-D state, got {state.shape[-1]}")
+    work = state if state.dtype in (torch.float32, torch.float64) else state.float()
+    default_rot = torch.tensor(
+        BRIDGE_DEFAULT_ROT, dtype=work.dtype, device=work.device
+    )
+    rot = quat_wxyz_to_mat(work[..., 3:7]) @ default_rot.transpose(0, 1)
+    rpy = mat_to_euler_sxyz(rot)
+    out = torch.cat([work[..., :3], rpy, work[..., 7:8]], dim=-1)
+    return out.to(state.dtype)
+
+
 def build_attention_mask_and_position_ids(
     pad_masks: torch.Tensor,
     att_masks: torch.Tensor,

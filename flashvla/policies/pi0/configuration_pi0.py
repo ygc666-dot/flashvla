@@ -228,6 +228,53 @@ class PI0FlashVLAConfig(PI0Config):
 
     use_adarms_time_cond: bool = False
 
+    # Keep the padded action dimensions out of the flow-matching loss.
+    # `max_action_dim` is 32 while the datasets here carry 7 real dims, and a
+    # converted checkpoint has zeros in `action_in_proj[:, 7:]` /
+    # `action_out_proj[7:, :]`, so those 25 dims can never be predicted and pin
+    # the loss at ``25/32 * E[noise^2] = 0.781``. Masking the noise there makes
+    # the reported loss equal the real-dim loss (comparable across steps/recipes).
+    mask_padded_action_dims: bool = False
+
+    # F6: give the state token a π0*-style *dedicated* 18-layer stack instead of
+    # a single `state_proj` linear. π0* runs `[vlm][proprio 1 tok][action 4 tok]`
+    # on one causal sequence, so the proprio block only ever sees the VLM prefix
+    # and itself. FlashVLA's suffix already has that shape — slot k is
+    # `[state, action x chunk_size]` with `att_mask=1` on the state token — so
+    # this flag swaps that one token's QKV/norm/MLP onto the proprio weights
+    # without touching the mask or positions. Default False keeps the shipped
+    # two-stream path bit-identical.
+    use_proprio_stack: bool = False
+    # 0 = take it from `input_features["observation.state"]` at build time.
+    proprio_dim: int = 0
+    # F6/S4: which layout `observation.state` reaches the proprio encoder in.
+    # ``raw`` = the datasets' own vector. ``bridge_euler7`` rewrites it to π0*'s
+    # bridge proprio ``[x, y, z, roll, pitch, yaw, grip]`` inside the
+    # preprocessor (the (1024, 7) encoder cannot consume 8 quaternion dims).
+    # Non-raw layouts are non-linear, so they run *before* normalization and need
+    # `state_stats_path` to supply the matching stat set.
+    state_layout: str = "raw"
+    state_stats_path: str | None = None
+
+    @property
+    def real_state_dim(self) -> int:
+        """Number of state dims the datasets actually carry (``observation.state``)."""
+        feature = (self.input_features or {}).get("observation.state")
+        dim = int(feature.shape[0]) if feature is not None else self.max_state_dim
+        return max(1, min(dim, self.max_state_dim))
+
+    @property
+    def proprio_input_dim(self) -> int:
+        """Width of the π0* proprio encoder input (``proprio_dim`` or the state dim)."""
+        return int(self.proprio_dim) if self.proprio_dim else self.real_state_dim
+
+    @property
+    def real_action_dim(self) -> int:
+        """Number of action dims the datasets actually carry (``action`` shape)."""
+        feature = (self.output_features or {}).get("action")
+        dim = int(feature.shape[0]) if feature is not None else self.max_action_dim
+        return max(1, min(dim, self.max_action_dim))
+
     @property
     def total_action_horizon(self) -> int:
         """Number of action steps in the noisy prediction window."""

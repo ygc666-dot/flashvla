@@ -38,7 +38,6 @@ from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import cycle
-from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
@@ -299,6 +298,115 @@ def apply_flashvla_training_init(
             "Applied flashvla_init mode=%r:\n%s",
             init_cfg.mode,
             "\n".join(reports),
+        )
+
+
+def reinit_state_path(policy, std: float, is_main_process: bool) -> None:
+    """Give `suffix_embedder.state_mlp_out` a non-zero normal init.
+
+    The policy zero-inits this layer, so the state FiLM contributes exactly 0 at
+    step 0 and can only grow *relatively* from there. Measured on bridge, it
+    reached 1e-5 against a 1e-2 time embedding after 4000 steps, and 250 steps at
+    10x lr moved it only +1.7% -- the branch never becomes visible to the action.
+    A fresh normal init puts it at the time embedding's scale immediately.
+    """
+    layer = policy.model.suffix_embedder.state_mlp_out
+    with torch.no_grad():
+        torch.nn.init.normal_(layer.weight, std=std)
+        torch.nn.init.zeros_(layer.bias)
+    if is_main_process:
+        logging.info(
+            "Re-initialized suffix_embedder.state_mlp_out with N(0, %s): |w|.mean=%s",
+            std,
+            float(layer.weight.abs().mean()),
+        )
+
+
+def reinit_proprio_in_proj(policy, std: float, is_main_process: bool) -> None:
+    """Overwrite `suffix_embedder.proprio_in_proj` with ``N(0, std)`` (F6/S5 arm ②).
+
+    A converted three-path checkpoint carries π0*'s pretrained proprio encoder in
+    that tensor. Re-initialising it at train start is what separates "the proprio
+    *block* is worth something" from "π0*'s *encoder* is worth something", while
+    keeping arm ② and arm ③ on one identical checkpoint (single variable).
+
+    ``std`` must be O(0.1): `f6_s0_s1.md` §7.4 measured that a 1e-3-scale init
+    never becomes visible under Adafactor, because its relative step size is
+    normalised by the parameter's own RMS -- a too-small draw would silently turn
+    this arm into a second "dead path" and bias the comparison.
+    """
+    embedder = policy.model.suffix_embedder
+    layer = getattr(embedder, "proprio_in_proj", None)
+    if layer is None:
+        raise ValueError(
+            "proprio_in_proj_init_std=%s was set but the model has no "
+            "`suffix_embedder.proprio_in_proj` (use_proprio_stack is off)" % std
+        )
+    with torch.no_grad():
+        torch.nn.init.normal_(layer.weight, std=std)
+        torch.nn.init.zeros_(layer.bias)
+    if is_main_process:
+        logging.info(
+            "Re-initialized suffix_embedder.proprio_in_proj with N(0, %s): "
+            "shape=%s |w|.mean=%s |w|.rms=%s",
+            std,
+            tuple(layer.weight.shape),
+            float(layer.weight.abs().mean()),
+            float(layer.weight.pow(2).mean().sqrt()),
+        )
+
+
+def scale_state_path_lr(optimizer, policy, mult: float, *, is_main_process: bool) -> None:
+    """Move the state-input path into its own param group at `mult` x lr.
+
+    Covers both spellings of that path: the `state_cond` FiLM layers
+    (`suffix_embedder.state_*`) and F6's `suffix_embedder.proprio_in_proj`, which
+    owns the state token once `use_proprio_stack=true`. Omitting the latter would
+    make an S0-style arm (encoder inside `state_proj` at 3x lr) differ from the
+    three-stream arm in two ways instead of one.
+
+    Must run *before* `accelerator.prepare` so the parameters are still the same
+    objects the optimizer was built from. The lr scheduler multiplies every
+    group's `lr` by one lambda, so the ratio survives the schedule.
+    """
+    if mult == 1.0:
+        return
+    state_ids = {
+        id(param)
+        for name, param in policy.named_parameters()
+        if ".suffix_embedder.state_" in name
+        or ".suffix_embedder.proprio_in_proj" in name
+    }
+    if not state_ids:
+        logging.warning(
+            "state_path_lr_mult=%s matched no state-path parameters "
+            "(`suffix_embedder.state_*` / `suffix_embedder.proprio_in_proj`)",
+            mult,
+        )
+        return
+
+    new_groups: list[dict] = []
+    moved = 0
+    for group in optimizer.param_groups:
+        kept = [p for p in group["params"] if id(p) not in state_ids]
+        boosted = [p for p in group["params"] if id(p) in state_ids]
+        if kept:
+            new_groups.append({**group, "params": kept})
+        if boosted:
+            moved += len(boosted)
+            new_groups.append({**group, "params": boosted, "lr": group["lr"] * mult})
+    # In-place so anything already holding `optimizer.param_groups` (the
+    # scheduler) keeps seeing the live list.
+    optimizer.param_groups[:] = new_groups
+
+    if is_main_process:
+        logging.info(
+            "state_path_lr_mult=%s -> %d param tensor(s) in their own group at lr %s "
+            "(groups now: %s)",
+            mult,
+            moved,
+            [f"{g['lr']:.3g}" for g in optimizer.param_groups],
+            len(optimizer.param_groups),
         )
 
 
@@ -818,7 +926,42 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
-    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    if getattr(cfg, "state_path_init_std", 0.0) > 0:
+        reinit_state_path(policy, float(cfg.state_path_init_std), is_main_process)
+    if getattr(cfg, "proprio_in_proj_init_std", 0.0) > 0:
+        reinit_proprio_in_proj(policy, float(cfg.proprio_in_proj_init_std), is_main_process)
+
+    # The state-path split has to happen *before* the scheduler is built.
+    # `LambdaLR` snapshots one lambda + base_lr *per param group* at construction
+    # and `get_lr()` zips them against `optimizer.param_groups`, so a group added
+    # afterwards (a) never gets its lr stepped and (b) leaves the checkpoint's
+    # scheduler_state with lists of two different lengths, which makes
+    # `load_scheduler_state` refuse to resume ("List length mismatch: expected 1,
+    # got 2" — hit on 2026-11-24 when resuming `pi0_flashvla_bridge_q8000`).
+    # Same net effect as `make_optimizer_and_scheduler` when the split is a no-op.
+    params = (
+        policy.get_optim_params()
+        if cfg.use_policy_training_preset
+        else policy.parameters()
+    )
+    if cfg.optimizer is None:
+        raise ValueError("Optimizer config is required but not provided in TrainPipelineConfig")
+    optimizer = cfg.optimizer.build(params)
+    scale_state_path_lr(
+        optimizer,
+        policy,
+        float(getattr(cfg, "state_path_lr_mult", 1.0)),
+        is_main_process=is_main_process,
+    )
+    lr_scheduler = (
+        cfg.scheduler.build(optimizer, cfg.steps) if cfg.scheduler is not None else None
+    )
+    if is_main_process and lr_scheduler is not None:
+        logging.info(
+            "LR scheduler built for %d param group(s): base_lrs=%s",
+            len(optimizer.param_groups),
+            [f"{b:.3g}" for b in getattr(lr_scheduler, "base_lrs", [])],
+        )
 
     step = 0
 

@@ -207,11 +207,17 @@ class PI0Attention(nn.Module):
         config: PI0Config,
         vlm_attention: nn.Module,
         action_expert_attention: nn.Module,
+        share_proprio: bool = False,
     ):
         super().__init__()
         self.config = config
         self.vlm_attention = vlm_attention
         self.action_expert_attention = action_expert_attention
+        # F6: π0* ties the proprio mixture to the action mixture
+        # (`pizero.py:274-276`, "action and proprio share weights"), so there is
+        # no third weight set at all. The proprio stream simply runs through the
+        # action expert's weights a second time.
+        self.share_proprio = share_proprio
         text_cfg = config.vlm_config.text_config
 
         self.rotary_emb = RotaryEmbedding(
@@ -225,15 +231,131 @@ class PI0Attention(nn.Module):
         self.num_heads = text_cfg.num_attention_heads
         self.head_dim = text_cfg.head_dim
 
+    def _stream_attentions(self) -> list:
+        """Attention modules in sequence order: prefix, action expert, (proprio).
+
+        With ``share_proprio`` the action module appears **twice on purpose**; it
+        must stay a plain list entry so the state dict is not duplicated (π0*'s
+        tying means one weight set, not two identical ones).
+        """
+        attns = [self.vlm_attention, self.action_expert_attention]
+        if self.share_proprio:
+            attns.append(self.action_expert_attention)
+        return attns
+
+    @staticmethod
+    def _as_three(parts: list) -> list:
+        """Normalise a 2- or 3-stream list to ``[prefix, action, proprio]``."""
+        if len(parts) == 3:
+            return list(parts)
+        if len(parts) == 2:
+            return [parts[0], parts[1], None]
+        raise ValueError(f"PI0Attention expects 2 or 3 streams, got {len(parts)}")
+
+    def _pack_streams(self, parts: list) -> Tensor:
+        """Join the per-stream q/k/v tensors into the one joint sequence.
+
+        ``parts`` is ``[prefix, action, proprio?]``; entries may be ``None``.
+
+        The suffix has to land on the wire in the exact order the attention mask
+        was built for. ``build_flashvla_attention_mask_and_position_ids`` derives
+        block ids as ``suffix_positions // L_suf`` (`utils.py:335-341`), i.e. the
+        sequence is ``N`` blocks of ``[pro_n, act_n(0..P-1)]`` -- see
+        `modeling_pi0_flashvla.py:533`. The action and proprio streams therefore
+        have to be **re-interleaved per block** here; a plain
+        ``cat([prefix, action, proprio])`` would drop every proprio token into
+        the middle of an action block and silently mis-map the mask.
+
+        ``N`` and ``P`` are derived from the shapes (proprio carries exactly one
+        token per block), so no config plumbing is needed.
+        """
+        prefix, action, proprio = self._as_three(parts)
+        live = [part for part in parts if part is not None]
+        if not live:
+            raise ValueError("PI0Attention received no hidden states")
+        dtypes = {part.dtype for part in live}
+        if len(dtypes) > 1:
+            raise ValueError(
+                f"PI0Attention streams have mixed dtypes {sorted(map(str, dtypes))}; "
+                "all backbones must share the compute dtype (see "
+                "PI0FlashVLAModel.to_bfloat16_for_selected_params)"
+            )
+
+        pieces = []
+        if prefix is not None:
+            pieces.append(prefix)
+        if action is not None and proprio is not None:
+            # q/k/v are [B, heads, seq, head_dim]: sequence lives on dim 2.
+            bsz, num_heads, num_blocks, head_dim = proprio.shape
+            if action.shape[2] % num_blocks:
+                raise ValueError(
+                    f"{action.shape[2]} action tokens do not split into "
+                    f"{num_blocks} proprio blocks"
+                )
+            per_block = action.shape[2] // num_blocks
+            act = action.view(bsz, num_heads, num_blocks, per_block, head_dim)
+            pieces.append(
+                torch.cat([proprio.unsqueeze(3), act], dim=3).reshape(
+                    bsz, num_heads, num_blocks * (per_block + 1), head_dim
+                )
+            )
+        else:
+            pieces.extend(part for part in (action, proprio) if part is not None)
+        return torch.cat(pieces, dim=2)
+
+    def _unpack_streams(self, merged: Tensor, parts: list) -> list:
+        """Inverse of :meth:`_pack_streams`; always returns one entry per stream.
+
+        ``merged`` is the flattened attention output ``[B, seq, heads * head_dim]``
+        and ``parts`` are the per-stream hidden states (sequence on dim 1).
+        """
+        prefix, action, proprio = self._as_three(parts)
+        bsz, _, width = merged.shape
+        outputs = []
+        cursor = 0
+        if prefix is None:
+            outputs.append(None)
+        else:
+            num = prefix.shape[1]
+            outputs.append(merged[:, cursor:cursor + num])
+            cursor += num
+        if action is not None and proprio is not None:
+            num_blocks = proprio.shape[1]
+            per_block = action.shape[1] // num_blocks
+            num = num_blocks * (per_block + 1)
+            suffix = merged[:, cursor:cursor + num].view(
+                bsz, num_blocks, per_block + 1, width
+            )
+            outputs.append(suffix[:, :, 1:].reshape(bsz, num_blocks * per_block, width))
+            outputs.append(suffix[:, :, 0])
+        else:
+            for part in (action, proprio):
+                if part is None:
+                    outputs.append(None)
+                    continue
+                num = part.shape[1]
+                outputs.append(merged[:, cursor:cursor + num])
+                cursor += num
+        return outputs[: len(parts)]
+
     def forward(self, hidden_states, attention_mask, position_ids, conds, use_cache: bool = False):
         """Forward pass with joint attention."""
-        attns = [self.vlm_attention, self.action_expert_attention]
+        attns = self._stream_attentions()
+        if len(hidden_states) != len(attns):
+            raise ValueError(
+                f"PI0Attention got {len(hidden_states)} hidden-state stream(s) but "
+                f"has {len(attns)} attention module(s). A length mismatch used to be "
+                "swallowed by zip(), which silently dropped a whole stream."
+            )
 
         q_states = []
         k_states = []
         v_states = []
         for attn, hs in zip(attns, hidden_states):
             if hs is None or hs.shape[1] == 0:
+                q_states.append(None)
+                k_states.append(None)
+                v_states.append(None)
                 continue
 
             if hasattr(attn, "qkv_proj"):
@@ -248,9 +370,9 @@ class PI0Attention(nn.Module):
             k_states.append(k)
             v_states.append(v)
 
-        q = torch.cat(q_states, dim=2)
-        k = torch.cat(k_states, dim=2)
-        v = torch.cat(v_states, dim=2)
+        q = self._pack_streams(q_states)
+        k = self._pack_streams(k_states)
+        v = self._pack_streams(v_states)
 
         q, k = self.rotary_emb(position_ids, q, k)
 
@@ -261,30 +383,46 @@ class PI0Attention(nn.Module):
         attn_outputs = attn_outputs.view(bsz, -1, self.num_heads * self.head_dim)
 
         outputs = []
-        start_pos = 0
-        for attn, hs in zip(attns, hidden_states):
-            if hs is None or hs.shape[1] == 0:
+        for attn, stream in zip(attns, self._unpack_streams(attn_outputs, hidden_states)):
+            if stream is None or stream.shape[1] == 0:
                 outputs.append(None)
                 continue
-            end_pos = start_pos + hs.shape[1]
-            out_emb = attn.o_proj(attn_outputs[:, start_pos:end_pos])
-            outputs.append(out_emb)
-            start_pos = end_pos
+            outputs.append(attn.o_proj(stream))
         return outputs
 
 
 class PI0MLP(nn.Module):
     """Joint MLP for VLM and action expert."""
     
-    def __init__(self, config: PI0Config, vlm_mlp: nn.Module, action_expert_mlp: nn.Module):
+    def __init__(
+        self,
+        config: PI0Config,
+        vlm_mlp: nn.Module,
+        action_expert_mlp: nn.Module,
+        share_proprio: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.vlm_mlp = vlm_mlp
         self.action_expert_mlp = action_expert_mlp
+        # See PI0Attention: π0* shares the action mixture with proprio.
+        self.share_proprio = share_proprio
+
+    def _stream_mlps(self) -> list:
+        """MLP modules in sequence order: prefix, action expert, (proprio)."""
+        mlps = [self.vlm_mlp, self.action_expert_mlp]
+        if self.share_proprio:
+            mlps.append(self.action_expert_mlp)
+        return mlps
 
     def forward(self, hidden_states):
         """Apply MLP to each backbone's hidden states."""
-        mlps = [self.vlm_mlp, self.action_expert_mlp]
+        mlps = self._stream_mlps()
+        if len(hidden_states) != len(mlps):
+            raise ValueError(
+                f"PI0MLP got {len(hidden_states)} hidden-state stream(s) but has "
+                f"{len(mlps)} MLP module(s); zip() would silently drop a stream."
+            )
         outputs = []
         for mlp, hs in zip(mlps, hidden_states):
             if hs is None or hs.shape[1] == 0:
@@ -309,21 +447,43 @@ class PI0ModelLayer(nn.Module):
         config: PI0Config,
         vlm_layer: nn.Module,
         action_expert_layer: nn.Module,
+        share_proprio: bool = False,
     ):
         super().__init__()
         self.config = config
+        # One norm per *weight set*: the shared proprio stream reuses the action
+        # norm, so registering a third one would duplicate the state dict keys.
         self.input_layernorm = [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
         self.post_attention_layernorm = [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        self.share_proprio = share_proprio
+        self.num_streams = 3 if share_proprio else 2
 
         self.self_attn = PI0Attention(
             config,
             vlm_layer.self_attn,
             action_expert_layer.self_attn,
+            share_proprio=share_proprio,
         )
-        self.mlp = PI0MLP(config, vlm_layer.mlp, action_expert_layer.mlp)
+        self.mlp = PI0MLP(
+            config,
+            vlm_layer.mlp,
+            action_expert_layer.mlp,
+            share_proprio=share_proprio,
+        )
+
+    @staticmethod
+    def _norm_at(norms, index: int):
+        """Norm for stream ``index``; the shared proprio stream maps onto the action norm."""
+        return norms[index if index < len(norms) else 1]
 
     def forward(self, hidden_states, attention_mask, position_ids, conds, use_cache: bool = False):
         """Forward pass with gated residual connections."""
+        if len(hidden_states) != self.num_streams:
+            raise ValueError(
+                f"PI0ModelLayer got {len(hidden_states)} hidden-state stream(s) but "
+                f"is wired for {self.num_streams} (share_proprio={self.share_proprio}). "
+                "A mismatch used to be swallowed by zip(), silently dropping a stream."
+            )
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
         gates = []
         for i in range(len(hidden_states)):
@@ -331,7 +491,7 @@ class PI0ModelLayer(nn.Module):
             if hs is None:
                 gates.append(None)
                 continue
-            hidden_states[i], gate = self.input_layernorm[i](hs, conds[i])
+            hidden_states[i], gate = self._norm_at(self.input_layernorm, i)(hs, conds[i])
             gates.append(gate)
 
         hidden_states = self.self_attn(hidden_states, attention_mask, position_ids, conds, use_cache=use_cache)
@@ -349,7 +509,7 @@ class PI0ModelLayer(nn.Module):
             if hs is None:
                 gates.append(None)
                 continue
-            hidden_states[i], gate = self.post_attention_layernorm[i](hs, conds[i])
+            hidden_states[i], gate = self._norm_at(self.post_attention_layernorm, i)(hs, conds[i])
             gates.append(gate)
 
         hidden_states = self.mlp(hidden_states)

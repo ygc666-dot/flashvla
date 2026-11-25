@@ -1,0 +1,102 @@
+# F6 / S4 冒烟：bridge 三路前向 + 7 维 `POS_EULER` proprio（2 步，单变量对照）。
+#
+# 方案与验收见 `docs/sdn_flashvla/pi0_flashvla/f6_s4.md`；与 `pi0_flashvla_bridge.yaml`
+# 的差别只有 4 处（都是 S4 的定义性改动，不再有第二个变量）：
+#   use_proprio_stack: true    state token 改由 π0* 的 proprio 栈产出
+#   proprio_dim: 7             `proprio_encoder` 是 (1024, 7)，输入必须是 7 维
+#   state_layout: bridge_euler7  processor 里把 8 维 state 转成 [x,y,z,rpy,grip]
+#   state_stats_path:          7 维 q01/q99（我们 4 个 bridge leaf 实测），
+#                              归一化仍在 NormalizerProcessorStep 里做，口径还是 QUANTILES
+#
+# 起点 ckpt（`--emit-proprio-stack --proprio-dim 7 --proprio-layout raw`，
+# verify.ok=true / unfilled_count=0 / proprio_in_proj=(1024,7)）：
+#   PY=/home/zjr/workspace_tj/StreamingVLA/miniconda_ygc/envs/flashvla/bin/python
+#   $PY scripts/p4/f6_s4_bridge_proprio.py --json logs/p4/f6_s4_bridge_proprio.json
+#   $PY scripts/p4/convert_pi0star.py \
+#     --src third_party/SDN/pretrained/open-pi-zero/bridge_beta_step19296_2024-12-26_22-30_42.pt \
+#     --data /data/zjr/simpler_lerobot/bridge/widowx_stack_cube/success \
+#     --empty-cameras 0 --write --dst ckpt/pi0star_bridge_flashvla_proprio_stack \
+#     --emit-proprio-stack --proprio-layout raw --proprio-dim 7 \
+#     --state-layout bridge_euler7 \
+#     --state-stats-path $PWD/logs/p4/f6_s4_bridge_state7_quantiles.json \
+#     --json logs/p4/convert_bridge_proprio_stack_write.json
+#
+#   CUDA_VISIBLE_DEVICES=4 bash train/train.sh train/configs/pi0/simpler/_f6s4_bridge_smoke.yaml 1
+
+policy:
+  type: pi0-flashvla
+  pretrained_path: /home/zjr/workspace_tj/StreamingVLA/flashvla/ckpt/pi0star_bridge_flashvla_proprio_stack
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  num_buffer_slots: 4
+  chunk_size: 4
+  n_action_steps: 4
+  empty_cameras: 0
+  cold_start_mode: zero_delta
+  use_adarms_time_cond: false
+  use_proprio_stack: true
+  proprio_dim: 7
+  state_layout: bridge_euler7
+  state_stats_path: /home/zjr/workspace_tj/StreamingVLA/flashvla/logs/p4/f6_s4_bridge_state7_quantiles.json
+  mask_padded_action_dims: true     # F2
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES                # F1：7 维 q01/q99 由 state_stats_path 提供
+    ACTION: QUANTILES               # F1
+
+dataset:
+  repo_id: simpler/bridge
+  video_backend: torchcodec
+
+robotwin_multitask:
+  enable: true
+  root: /data/zjr/simpler_lerobot/bridge
+  config_subdirs:
+  - success
+
+output_dir: /home/zjr/workspace_tj/StreamingVLA/flashvla/runs/f6_s4_bridge_smoke
+job_name: f6-s4-bridge-smoke
+batch_size: 4
+grad_accum_steps: 8
+steps: 2
+num_workers: 4
+seed: 1000
+
+fsdp:
+  enable: false
+  mixed_precision: bf16
+  reduce_dtype: float32
+  reshard_after_forward: false
+  cpu_offload: false
+  state_dict_type: SHARDED_STATE_DICT
+  save_pretrained_max_shard_size: 50GB
+
+use_policy_training_preset: false
+optimizer:
+  type: adafactor
+  lr: 5.0e-05
+  weight_decay: 1.0e-10
+  grad_clip_norm: 1.0
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 1
+  peak_lr: 5.0e-05
+  decay_lr: 2.5e-07
+  num_decay_steps: 2
+
+state_path_lr_mult: 3.0       # F3（三路下覆盖 state_proj + proprio_in_proj）
+
+flashvla_init:
+  mode: default
+
+save_checkpoint: true
+save_freq: 1
+checkpoint_keep_last: 2
+checkpoint_keep_every_n_steps: 0
+log_freq: 1
+wandb:
+  enable: false
+  project: p4-f6-s4
+  entity: null
+  disable_artifact: true

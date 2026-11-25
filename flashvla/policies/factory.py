@@ -214,11 +214,26 @@ def make_pre_post_processors(
                 has_pretrained_processors = False
 
         if has_pretrained_processors:
+            pre_overrides = dict(kwargs.get("preprocessor_overrides", {}))
+            if policy_cfg.type.startswith("pi05"):
+                # Checkpoints written before `FlashVLAPi05PrepareLanguageProcessorStep.
+                # get_config` existed saved `"config": {}` for that step, so it reloads
+                # with `state_cond=False` and turns the prompt into
+                # "Task: X, State: ...;" -- a prompt the state_cond=True checkpoints
+                # never saw in training. The policy config knows the right value, so
+                # restore it unless the caller asked for something specific.
+                lang_step = pre_overrides.setdefault(
+                    "flashvla_pi05_prepare_language_processor_step", {}
+                )
+                lang_step.setdefault("state_cond", bool(getattr(policy_cfg, "state_cond", False)))
+                lang_step.setdefault(
+                    "max_state_dim", int(getattr(policy_cfg, "max_state_dim", 32))
+                )
             return (
                 PolicyProcessorPipeline.from_pretrained(
                     pretrained_model_name_or_path=pretrained_path,
                     config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
-                    overrides=kwargs.get("preprocessor_overrides", {}),
+                    overrides=pre_overrides,
                     to_transition=batch_to_transition,
                     to_output=transition_to_batch,
                 ),

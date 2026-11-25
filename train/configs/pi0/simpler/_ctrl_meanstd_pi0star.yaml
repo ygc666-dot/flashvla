@@ -1,0 +1,84 @@
+# 步数对齐的**对照组**：旧配方（MEAN_STD / 不掩填充维 / state_proj 零初始化 / state lr ×1）。
+#
+# 用途：回答「F1+F2+F3 到底有没有用」。与 `pi0_flashvla_bridge.yaml` 除以下四行外完全一致，
+# 只跑 500 步、在同一台机器上用同一个部署路径探针（`scripts/p4/probe_actions.py`）对比
+# `runs/pi0_flashvla_bridge_q8000/checkpoints/000500`。
+# 背景与判据：`docs/sdn_flashvla/pi0_flashvla/pi_star_analysis.md` §5（F5 实测记录）。
+#
+# 起点必须是**旧**转换产物（`state_proj` 全零）：
+#   $PY scripts/p4/convert_pi0star.py \
+#     --src third_party/SDN/pretrained/open-pi-zero/bridge_beta_step19296_2024-12-26_22-30_42.pt \
+#     --data /data/zjr/simpler_lerobot/bridge/widowx_stack_cube/success \
+#     --empty-cameras 0 --write --dst ckpt/pi0star_bridge_flashvla_ctrl
+
+policy:
+  type: pi0-flashvla
+  pretrained_path: /home/zjr/workspace_tj/StreamingVLA/flashvla/ckpt/pi0star_bridge_flashvla_ctrl
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  num_buffer_slots: 4
+  chunk_size: 4
+  n_action_steps: 4
+  empty_cameras: 0
+  cold_start_mode: zero_delta
+  use_adarms_time_cond: false
+  mask_padded_action_dims: false     # 旧配方：25 个填充维照旧参与 loss
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MEAN_STD                  # 旧配方
+    ACTION: MEAN_STD                 # 旧配方
+
+dataset:
+  repo_id: simpler/bridge
+  video_backend: torchcodec
+
+robotwin_multitask:
+  enable: true
+  root: /data/zjr/simpler_lerobot/bridge
+  config_subdirs:
+  - success
+
+output_dir: /data/zjr/simpler_lerobot/runs/pi0_ctrl_meanstd_500
+job_name: pi0-ctrl-meanstd-500
+batch_size: 4
+grad_accum_steps: 8
+steps: 500
+num_workers: 4
+seed: 1000
+
+fsdp:
+  enable: false
+  mixed_precision: bf16
+  reduce_dtype: float32
+  reshard_after_forward: false
+  cpu_offload: false
+  state_dict_type: SHARDED_STATE_DICT
+  save_pretrained_max_shard_size: 50GB
+
+use_policy_training_preset: false
+optimizer:
+  type: adafactor
+  lr: 5.0e-05
+  weight_decay: 1.0e-10
+  grad_clip_norm: 1.0
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 300
+  peak_lr: 5.0e-05
+  decay_lr: 2.5e-07
+  num_decay_steps: 4000             # 旧配方的调度；step 500 处 lr≈5.0e-5，与新配方一致
+
+flashvla_init:
+  mode: default
+
+save_checkpoint: true
+save_freq: 500
+checkpoint_keep_last: 2
+checkpoint_keep_every_n_steps: 0
+log_freq: 50
+wandb:
+  enable: false
+  project: p4-pi0star-ctrl
+  entity: null
+  disable_artifact: true

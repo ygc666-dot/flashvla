@@ -1,0 +1,80 @@
+# FlashVLA on SIMPLER / fractal (google_robot, 3 Hz) — P3 main experiment (M=1 gate).
+#
+# Data: P2 output `3_2_todo.md` §5.5, produced by
+#   sim_eval/simpler/convert_simpler_to_lerobot.py --group fractal
+# Leaves are auto-discovered as <root>/<task>/<subdir>/meta/info.json, so the
+# 5 tasks x 2 outcomes never have to be listed here.
+#
+# Arm definitions:
+#   main        : config_subdirs [success]            (68_627 frames overall, 50_843 for fractal)
+#   augmentation: config_subdirs [success, failure]   (§5.3 anti-drift, 170_091 frames)
+
+policy:
+  type: pi05-flashvla
+  pretrained_path: lerobot/pi05_base
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  state_cond: true          # pi0* is continuous proprio; discrete 256-bin hurts fine tasks
+  num_buffer_slots: 4       # N: cold-start hold-pose = N x C frames = 5.3 s at 3 Hz
+  chunk_size: 4             # C: aligns with pi0* horizon_steps=4
+  n_action_steps: 4         # must equal chunk_size, otherwise crossfade has no second block
+  empty_cameras: 2          # single camera (observation.images.top) + 2 masked slots
+  freeze_vision_encoder: false
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MEAN_STD         # stats come from this dataset, not from pi0*'s json
+    ACTION: MEAN_STD
+
+dataset:
+  repo_id: simpler/fractal  # only a prefix; the leaves come from robotwin_multitask
+  video_backend: torchcodec
+
+robotwin_multitask:
+  enable: true
+  root: /data/zjr/simpler_lerobot/fractal
+  config_subdirs: [success]
+
+output_dir: /data/zjr/simpler_lerobot/runs/pi05_flashvla_fractal_success
+job_name: pi05-flashvla-fractal-success
+batch_size: 8
+grad_accum_steps: 4          # global batch 32
+steps: 12000                 # 50_843 frames / 32 = 1_589 step/epoch -> 7.6 epoch
+num_workers: 4
+seed: 1000
+
+fsdp:
+  enable: true               # 3B full-parameter AdamW needs >= 2 cards (L40S)
+  mixed_precision: bf16
+  reduce_dtype: float32
+  reshard_after_forward: false
+  cpu_offload: false
+  state_dict_type: SHARDED_STATE_DICT
+  save_pretrained_max_shard_size: 50GB
+
+use_policy_training_preset: false
+optimizer:
+  type: adamw
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-10
+  grad_clip_norm: 1.0
+
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 500
+  peak_lr: 5.0e-5
+  decay_lr: 2.5e-7
+  num_decay_steps: 12000
+
+save_checkpoint: true
+save_freq: 1000
+checkpoint_keep_last: 5
+checkpoint_keep_every_n_steps: 0
+
+log_freq: 50
+wandb:
+  enable: true
+  project: flashvla-simpler-fractal
+  entity: null
+  disable_artifact: true

@@ -532,6 +532,20 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
 
     policy.eval()
 
+    # ---- R3: 读出侧 SDN 选择（环境变量开关；不设则该分支不执行，行为完全不变）----
+    if os.environ.get("SDN_NUM_SAMPLES"):
+        # 就地挂载，不替换 policy 对象：eval_policy 有 isinstance(policy, PreTrainedPolicy) 校验
+        from flashvla.policies.pi05.sdn_selector import attach_sdn
+
+        attach_sdn(
+            policy,
+            num_samples=int(os.environ["SDN_NUM_SAMPLES"]),
+            smoothness=os.environ.get("SDN_SMOOTHNESS", "acceleration"),
+            long_horizon=(
+                int(os.environ["SDN_LONG_HORIZON"]) if os.environ.get("SDN_LONG_HORIZON") else None
+            ),
+        )
+
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
