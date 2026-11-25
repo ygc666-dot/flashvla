@@ -4,6 +4,28 @@
 
 **FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
+> **Note: this is a modified fork, not the official release.**
+> This repository is `ygc666-dot`'s working copy of
+> [z-lab/flashvla](https://github.com/z-lab/flashvla). Everything here is the
+> upstream code plus our own **unpublished, work-in-progress** modifications
+> from an SDN × FlashVLA study:
+>
+> - π0 (π0\*) proprio / action three-stream stack under `flashvla/policies/pi0/`
+> - read-out-side SDN selector for the non-streaming pi0.5 path
+>   (`flashvla/policies/pi05/sdn_selector.py`)
+> - SIMPLER data conversion and evaluation pipeline
+>   (`sim_eval/simpler/`, `scripts/p0`–`p4`)
+> - SIMPLER training configs (`train/configs/{pi0,pi05}/simpler/`) and unit
+>   tests (`tests/`)
+> - `third_party/SDN` is pinned to
+>   [ygc666-dot/flashvla_SDN](https://github.com/ygc666-dot/flashvla_SDN), a fork
+>   of [ducido/SDN](https://github.com/ducido/SDN) with a FlashVLA policy client
+>
+> Development notes live in [`docs/sdn_flashvla/`](docs/sdn_flashvla/) and
+> [`docs/biye_paper/`](docs/biye_paper/). All numbers we produced are
+> exploratory and are **not** the results reported in the paper; use the
+> upstream repository for the official code and benchmarks.
+
 ## Install
 
 ```bash
