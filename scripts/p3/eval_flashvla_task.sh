@@ -22,6 +22,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 ROOT=$(pwd)
 ENVS=${F7_ENVS:-/home/zjr/workspace_tj/StreamingVLA/miniconda_ygc/envs}
+LOGDIR=${F7_LOGDIR:-$ROOT/logs}
 
 GPU=4
 CKPT=""
@@ -51,9 +52,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 unset PYTHONPATH BASH_ENV
 
 PORT=$((12400 + GPU))
-mkdir -p "$OUT" "$ROOT/logs"
-SL="$ROOT/logs/f7_srv_${TAG}_gpu${GPU}.log"
-EL="$ROOT/logs/f7_${TASK}_${TAG}_gpu${GPU}.log"
+mkdir -p "$OUT" "$LOGDIR"
+SL="$LOGDIR/f7_srv_${TAG}_gpu${GPU}.log"
+EL="$LOGDIR/f7_${TASK}_${TAG}_gpu${GPU}.log"
 
 echo "[eval] $(date) ckpt=$CKPT task=$TASK n=$N seed=$SEED gpu=$GPU port=$PORT" | tee "$EL"
 CUDA_VISIBLE_DEVICES="$GPU" "$ENVS/flashvla/bin/python" scripts/p3/flashvla_server.py \
