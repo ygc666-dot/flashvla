@@ -35,3 +35,6 @@ nohup.out
 *.swp
 *.swo
 .DS_Store
+
+# local training runs (S2 smoke keeps checkpoints inside the repo)
+runs/
